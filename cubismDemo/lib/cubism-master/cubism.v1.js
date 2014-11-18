@@ -1,5 +1,5 @@
 (function(exports){
-var cubism = exports.cubism = {version: "1.2.2"};
+var cubism = exports.cubism = {version: "1.6.0", pixelWidth: 1};
 var cubism_id = 0;
 function cubism_identity(d) { return d; }
 cubism.option = function(name, defaultValue) {
@@ -32,15 +32,14 @@ cubism.context = function() {
       event = d3.dispatch("prepare", "beforechange", "change", "focus"),
       scale = context.scale = d3.time.scale().range([0, size]),
       timeout,
-      focusAnchor = null,
       focus;
 
   function update() {
     var now = Date.now();
     stop0 = new Date(Math.floor((now - serverDelay - clientDelay + shift) / step) * step);
-    start0 = new Date(stop0 - size * step);
+    start0 = new Date(stop0 - (size / cubism.pixelWidth | 0) * step);
     stop1 = new Date(Math.floor((now - serverDelay + shift) / step) * step);
-    start1 = new Date(stop1 - size * step);
+    start1 = new Date(stop1 - (size / cubism.pixelWidth | 0) * step);
     scale.domain([start0, stop0]);
     return context;
   }
@@ -54,7 +53,7 @@ cubism.context = function() {
 
     timeout = setTimeout(function prepare() {
       stop1 = new Date(Math.floor((Date.now() - serverDelay + shift) / step) * step);
-      start1 = new Date(stop1 - size * step);
+      start1 = new Date(stop1 - (size / cubism.pixelWidth | 0) * step);
       event.prepare.call(context, start1, stop1);
 
       setTimeout(function() {
@@ -99,12 +98,6 @@ cubism.context = function() {
     shift = +_;
     return update();
   };
-  
-  context.focusAnchor = function(_) {
-      if (!arguments.length) return focusAnchor;
-      focusAnchor = _;
-      return context;
-  };
 
   // The server delay is the amount of time we wait for the server to compute a
   // metric. This delay may result from clock skew or from delays collecting
@@ -126,7 +119,6 @@ cubism.context = function() {
 
   // Sets the focus to the specified index, and dispatches a "focus" event.
   context.focus = function(i) {
-    i = i === null ? focusAnchor : i;
     event.focus.call(context, focus = i);
     return context;
   };
@@ -153,15 +145,15 @@ cubism.context = function() {
   d3.select(window).on("keydown.context-" + ++cubism_id, function() {
     if(d3.event.target.nodeName.toLowerCase() == 'input')
         return;
-      
+    
     switch (!d3.event.metaKey && d3.event.keyCode) {
       case 37: // left
         if (focus == null) focus = size - 1;
-        if (focus > 0) context.focus(--focus);
+        if (focus > 0) context.focus(focus -= cubism.pixelWidth);
         break;
       case 39: // right
         if (focus == null) focus = size - 2;
-        if (focus < size - 1) context.focus(++focus);
+        if (focus < size - 1) context.focus(focus += cubism.pixelWidth);
         break;
       default: return;
     }
@@ -205,6 +197,191 @@ cubism_contextPrototype.cube = function(host) {
 };
 
 var cubism_cubeFormatDate = d3.time.format.iso;
+/* librato (http://dev.librato.com/v1/post/metrics) source
+ * If you want to see an example of how to use this source, check: https://gist.github.com/drio/5792680
+ */
+cubism_contextPrototype.librato = function(user, token) {
+  var source      = {},
+      context     = this;
+      auth_string = "Basic " + btoa(user + ":" + token);
+      avail_rsts  = [ 1, 60, 900, 3600 ];
+
+  /* Given a step, find the best librato resolution to use.
+   *
+   * Example:
+   *
+   * (s) : cubism step
+   *
+   * avail_rsts   1 --------------- 60 --------------- 900 ---------------- 3600
+   *                                |    (s)            |
+   *                                |                   |
+   *                              [low_res             top_res]
+   *
+   * return: low_res (60)
+   */
+  function find_ideal_librato_resolution(step) {
+    var highest_res = avail_rsts[0],
+        lowest_res  = avail_rsts[avail_rsts.length]; // high and lowest available resolution from librato
+
+    /* If step is outside the highest or lowest librato resolution, pick them and we are done */
+    if (step >= lowest_res)
+      return lowest_res;
+
+    if (step <= highest_res)
+      return highest_res;
+
+    /* If not, find in what resolution interval the step lands. */
+    var iof, top_res, i;
+    for (i=step; i<=lowest_res; i++) {
+      iof = avail_rsts.indexOf(i);
+      if (iof > -1) {
+        top_res = avail_rsts[iof];
+        break;
+      }
+    }
+
+    var low_res;
+    for (i=step; i>=highest_res; i--) {
+      iof = avail_rsts.indexOf(i);
+      if (iof > -1) {
+        low_res = avail_rsts[iof];
+        break;
+      }
+    }
+
+    /* What's the closest librato resolution given the step ? */
+    return ((top_res-step) < (step-low_res)) ? top_res : low_res;
+  }
+
+  function find_librato_resolution(sdate, edate, step) {
+    var i_size      = edate - sdate,                 // interval size
+        month       = 2419200,
+        week        = 604800,
+        two_days    = 172800,
+        ideal_res;
+
+    if (i_size > month)
+      return 3600;
+
+    ideal_res = find_ideal_librato_resolution(step);
+
+    /*
+     * Now we have the ideal resolution, but due to the retention policies at librato, maybe we have
+     * to use a higher resolution.
+     * http://support.metrics.librato.com/knowledgebase/articles/66838-understanding-metrics-roll-ups-retention-and-grap
+     */
+    if (i_size > week && ideal_res < 900)
+      return 900;
+    else if (i_size > two_days && ideal_res < 60)
+      return 60;
+    else
+      return ideal_res;
+  }
+
+  /* All the logic to query the librato API is here */
+  var librato_request = function(composite) {
+    var url_prefix  = "https://metrics-api.librato.com/v1/metrics";
+
+    function make_url(sdate, edate, step) {
+      var params    = "compose="     + composite +
+                      "&start_time=" + sdate     +
+                      "&end_time="   + edate     +
+                      "&resolution=" + find_librato_resolution(sdate, edate, step);
+      return url_prefix + "?" + params;
+    }
+
+    /*
+     * We are most likely not going to get the same number of measurements
+     * cubism expects for a particular context: We have to perform down/up
+     * sampling
+     */
+    function down_up_sampling(isdate, iedate, step, librato_mm) {
+      var av = [];
+
+      for (i=isdate; i<=iedate; i+=step) {
+        var int_mes = [];
+        while (librato_mm.length && librato_mm[0].measure_time <= i) {
+          int_mes.push(librato_mm.shift().value);
+        }
+
+        var v;
+        if (int_mes.length) { /* Compute the average */
+          v = int_mes.reduce(function(a, b) { return a + b }) / int_mes.length;
+        } else { /* No librato values on interval */
+          v = (av.length) ? av[av.length-1] : 0;
+        }
+        av.push(v);
+      }
+
+      return av;
+    }
+
+    request = {};
+
+    request.fire = function(isdate, iedate, step, callback_done) {
+      var a_values = []; /* Store partial values from librato */
+
+      /*
+       * Librato has a limit in the number of measurements we get back in a request (100).
+       * We recursively perform requests to the API to ensure we have all the data points
+       * for the interval we are working on.
+       */
+      function actual_request(full_url) {
+        d3.json(full_url)
+          .header("X-Requested-With", "XMLHttpRequest")
+          .header("Authorization", auth_string)
+          .header("Librato-User-Agent", 'cubism/' + cubism.version)
+          .get(function (error, data) { /* Callback; data available */
+            if (!error) {
+              if (data.measurements.length === 0) {
+                return
+              }
+              data.measurements[0].series.forEach(function(o) { a_values.push(o); });
+
+              var still_more_values = 'query' in data && 'next_time' in data.query;
+              if (still_more_values) {
+                actual_request(make_url(data.query.next_time, iedate, step));
+              } else {
+                var a_adjusted = down_up_sampling(isdate, iedate, step, a_values);
+                callback_done(a_adjusted);
+              }
+            }
+          });
+      }
+
+      actual_request(make_url(isdate, iedate, step));
+    };
+
+    return request;
+  };
+
+  /*
+   * The user will use this method to create a cubism source (librato in this case)
+   * and call .metric() as necessary to create metrics.
+   */
+  source.metric = function(m_composite) {
+    return context.metric(function(start, stop, step, callback) {
+      /* All the librato logic is here; .fire() retrieves the metrics' data */
+      librato_request(m_composite)
+        .fire(cubism_libratoFormatDate(start),
+              cubism_libratoFormatDate(stop),
+              cubism_libratoFormatDate(step),
+              function(a_values) { callback(null, a_values); });
+
+      }, m_composite += "");
+    };
+
+  /* This is not used when the source is librato */
+  source.toString = function() {
+    return "librato";
+  };
+
+  return source;
+};
+
+var cubism_libratoFormatDate = function(time) {
+  return Math.floor(time / 1000);
+};
 cubism_contextPrototype.graphite = function(host) {
   if (!arguments.length) host = "";
   var source = {},
@@ -274,148 +451,304 @@ function cubism_graphiteParse(text) {
       .slice(1) // the first value is always None?
       .map(function(d) { return +d; });
 }
+cubism_contextPrototype.gangliaWeb = function(config) {
+  var host = '',
+      uriPathPrefix = '/ganglia2/';
+ 
+  if (arguments.length) {
+    if (config.host) {
+      host = config.host;
+    }
+
+    if (config.uriPathPrefix) {
+      uriPathPrefix = config.uriPathPrefix;
+
+      /* Add leading and trailing slashes, as appropriate. */
+      if( uriPathPrefix[0] != '/' ) {
+        uriPathPrefix = '/' + uriPathPrefix;
+      }
+
+      if( uriPathPrefix[uriPathPrefix.length - 1] != '/' ) {
+        uriPathPrefix += '/';
+      }
+    }
+  }
+
+  var source = {},
+      context = this;
+
+  source.metric = function(metricInfo) {
+
+    /* Store the members from metricInfo into local variables. */
+    var clusterName = metricInfo.clusterName, 
+        metricName = metricInfo.metricName, 
+        hostName = metricInfo.hostName,
+        isReport = metricInfo.isReport || false,
+        titleGenerator = metricInfo.titleGenerator ||
+          /* Reasonable (not necessarily pretty) default for titleGenerator. */
+          function(unusedMetricInfo) {
+            /* unusedMetricInfo is, well, unused in this default case. */
+            return ('clusterName:' + clusterName + 
+                    ' metricName:' + metricName +
+                    (hostName ? ' hostName:' + hostName : ''));
+          },
+        onChangeCallback = metricInfo.onChangeCallback;
+    
+    /* Default to plain, simple metrics. */
+    var metricKeyName = isReport ? 'g' : 'm';
+
+    var gangliaWebMetric = context.metric(function(start, stop, step, callback) {
+
+      function constructGangliaWebRequestQueryParams() {
+        return ('c=' + clusterName +
+                '&' + metricKeyName + '=' + metricName + 
+                (hostName ? '&h=' + hostName : '') + 
+                '&cs=' + start/1000 + '&ce=' + stop/1000 + '&step=' + step/1000 + '&graphlot=1');
+      }
+
+      d3.json(host + uriPathPrefix + 'graph.php?' + constructGangliaWebRequestQueryParams(),
+        function(result) {
+          if( !result ) {
+            return callback(new Error("Unable to fetch GangliaWeb data"));
+          }
+
+          callback(null, result[0].data);
+        });
+
+    }, titleGenerator(metricInfo));
+
+    gangliaWebMetric.toString = function() {
+      return titleGenerator(metricInfo);
+    };
+
+    /* Allow users to run their custom code each time a gangliaWebMetric changes.
+     *
+     * TODO Consider abstracting away the naked Cubism call, and instead exposing 
+     * a callback that takes in the values array (maybe alongwith the original
+     * start and stop 'naked' parameters), since it's handy to have the entire
+     * dataset at your disposal (and users will likely implement onChangeCallback
+     * primarily to get at this dataset).
+     */
+    if (onChangeCallback) {
+      gangliaWebMetric.on('change', onChangeCallback);
+    }
+
+    return gangliaWebMetric;
+  };
+
+  // Returns the gangliaWeb host + uriPathPrefix.
+  source.toString = function() {
+    return host + uriPathPrefix;
+  };
+
+  return source;
+};
+
 cubism_contextPrototype.linechart = function() {
   var context = this,
-      mode = "offset",
-      buffer = document.createElement("canvas"),
-      width = buffer.width = context.size(),
-      height = buffer.height = 30,
+      width = context.size(),
+      height = 30,
+      summarize = function(d) { if (d.length > 0) { return d[0]; } else { return 0; } }
       scale = d3.scale.linear().interpolate(d3.interpolateRound),
-      metric = cubism_identity,
-      extent = null,
+      metrics = cubism_identity,
       title = cubism_identity,
-      format = d3.format(".2s"),
-      colors = ["#08519c","#3182bd","#6baed6","#bdd7e7","#bae4b3","#74c476","#31a354","#006d2c"];
+      format = d3.format("f"),
+      tickFormat = function(d) { if (d > 0) { return  d; } }
+      colors = ["#08519c","#74c476","#6baed6","#006d2c","#3182bd","#bae4b3","#bdd7e7","#31a354"],
+      step = 1,
+      stroke_width = 1,
+      axis_width = 0,
+      tick_position = [0.4, 0.8],
+      auto_min = false,
+      auto_max = true;
 
   function linechart(selection) {
 
     selection
-        .on("mousemove.linechart", function() { context.focus(Math.round(d3.mouse(this)[0])); })
-        .on("mouseout.linechart", function() { context.focus(null); });
+      .on("mousemove.linechart", function() { context.focus(Math.round(d3.mouse(this)[0])); })
+      .on("mouseout.linechart", function() { context.focus(null); });
 
-    selection.append("canvas")
-        .attr("width", width)
-        .attr("height", height);
-
-    selection.append("span")
-        .attr("class", "title")
-        .text(title);
-
-    selection.append("span")
-        .attr("class", "value");
+    selection.append("svg")
+      .attr("width", width)
+      .attr("height", height);
 
     selection.each(function(d, i) {
+
       var that = this,
+          metrics_ = typeof metrics === "function" ? metrics.call(that, d, i) : metrics,
           id = ++cubism_id,
-          metric_ = typeof metric === "function" ? metric.call(that, d, i) : metric,
-          colors_ = typeof colors === "function" ? colors.call(that, d, i) : colors,
-          extent_ = typeof extent === "function" ? extent.call(that, d, i) : extent,
-          start = -Infinity,
-          step = context.step(),
-          canvas = d3.select(that).select("canvas"),
-          span = d3.select(that).select(".value"),
-          max_,
-          m = colors_.length >> 1,
-          ready;
+          line = d3.svg.line().interpolate("basis"),
+          svg = d3.select(that).select("svg"),
+          ready = 0;
 
-      canvas.datum({id: id, metric: metric_});
-      canvas = canvas.node().getContext("2d");
+      function change() {
+        if (metrics_.length == 0)
+            return;
 
-      function change(start1, stop) {
-        canvas.save();
+        var data_set = [],
+            data_len = 0,
+            data_max = 0,
+            data_min = Infinity;
 
-        // compute the new extent and ready flag
-        var extent = metric_.extent();
-        ready = extent.every(isFinite);
-        if (extent_ != null) extent = extent_;
+        for (var m in metrics_) {
+          var data = [],
+              i = 0;
 
-        // if this is an update (with no extent change), copy old values!
-        var i0 = 0, max = Math.max(-extent[0], extent[1]);
-        if (this === context) {
-          if (max == max_) {
-            i0 = width - cubism_metricOverlap;
-            var dx = (start1 - start) / step;
-            if (dx < width) {
-              var canvas0 = buffer.getContext("2d");
-              canvas0.clearRect(0, 0, width, height);
-              canvas0.drawImage(canvas.canvas, dx, 0, width - dx, height, 0, 0, width - dx, height);
-              canvas.clearRect(0, 0, width, height);
-              canvas.drawImage(canvas0.canvas, 0, 0);
+          while (i < context.size()) {
+            var window = [];
+
+            for (var j = 0; j < step && i < context.size(); ++j, ++i) {
+              window.push(metrics_[m].valueAt(i));
+            }
+
+            var value = summarize(window);
+            if (isFinite(value)) {
+              data.push(value);
+            } else {
+              data.push(0);
             }
           }
-          start = start1;
-        }
 
-        // update the domain
-        scale.domain([0, max_ = max]);
+          data_set.push(data);
+          data_len = data.length;
 
-        // clear for the new data
-        canvas.clearRect(i0, 0, width - i0, height);
+          var mm, nn, hh;
 
-        // record whether there are negative values to display
-        var negative;
+          /* the real mininum and maxinum value in the current dataset */
+          mm = d3.max(data);
+          nn = d3.min(data);
 
-        // positive bands
-        for (var j = 0; j < m; ++j) {
-          canvas.fillStyle = colors_[m + j];
-
-          // Adjust the range based on the current band index.
-          var y0 = (j - m + 1) * height;
-          scale.range([m * height + y0, y0]);
-          y0 = scale(0);
-
-          for (var i = i0, n = width, y1; i < n; ++i) {
-            y1 = metric_.valueAt(i);
-            if (y1 <= 0) { negative = true; continue; }
-            canvas.fillRect(i, y1 = scale(y1), 1, y0 - y1);
+          /* constant value */
+          if (mm == nn) {
+            /* if mm is zero, display a default range from -10 to 10 */
+            hh = Math.min(10, mm * 0.2);
+            max = mm + hh;
+            min = mm - hh;
           }
-        }
-
-        if (negative) {
-          // enable offset mode
-          if (mode === "offset") {
-            canvas.translate(0, height);
-            canvas.scale(1, -1);
+          /* there is a range, make it look nice */
+          else {
+            hh = Math.pow(10, Math.floor(Math.log(mm < 1 ? 1 : mm) / Math.LN10));
+            while (hh > (mm - nn) / 2)
+              hh = hh / 10;
+            min = Math.floor(nn / hh) * hh;
+            max = (1 + Math.floor(mm / hh)) * hh
           }
 
-          // negative bands
-          for (var j = 0; j < m; ++j) {
-            canvas.fillStyle = colors_[m - 1 - j];
-
-            // Adjust the range based on the current band index.
-            var y0 = (j - m + 1) * height;
-            scale.range([m * height + y0, y0]);
-            y0 = scale(0);
-
-            for (var i = i0, n = width, y1; i < n; ++i) {
-              y1 = metric_.valueAt(i);
-              if (y1 >= 0) continue;
-              canvas.fillRect(i, scale(-y1), 1, y0 - scale(-y1));
-            }
-          }
+          if (auto_min) data_min = Math.min(data_min, min);
+          if (auto_max) data_max = Math.max(data_max, max);
         }
 
-        canvas.restore();
+        if (!isFinite(data_max))
+          return;
+        if (!isFinite(data_min))
+          data_min = 0;
+
+        var x = d3.scale.linear().domain([0, data_len]).range([0, width]);
+        var y = scale.domain([data_max, data_min]).range([0, height]);
+
+        line.x(function(d, i) { return x(i); })
+            .y(function(d) { return y(d); });
+
+        svg.selectAll("path").remove();
+        svg.selectAll("g").remove();
+
+        svg.append("g")
+          .attr("class", "left axis")
+          .attr("transform", "translate(" + axis_width + ", 0)")
+          .call(d3.svg.axis()
+                .scale(y)
+                .tickValues(tick_position.map(function(x) {
+                  return x * data_max + (1 - x) * data_min;
+                }))
+                .orient("left")
+                .tickFormat(tickFormat)
+               );
+
+        var data_offset = Math.floor(axis_width * data_len / width);
+        for (var d in data_set) {
+          svg.append("path").attr("d", line(data_set[d].slice(data_offset)))
+            .attr("transform", "translate(" + axis_width + ", 0)")
+            .attr("width", width - axis_width)
+            .attr("stroke", colors[d])
+            .attr("stroke-width", stroke_width)
+            .attr("fill", "none");
+        }
+
+        svg.append("g").attr("class", "toolpit");
+
+        svg.select(".toolpit").append("rect")
+          .attr("class", "toolpit-rect")
+          .attr("x", 5)
+          .attr("rx", 5)
+          .attr("ry", 5)
+          .attr("stroke", "grey")
+          .attr("stroke-width", 2)
+          .attr("fill", "rgb(255,255,255)")
+          .attr("fill-opacity", 0.8);
+
+        svg.select(".toolpit").append("text")
+          .attr("class", "toolpit-text")
+          .attr("font-family", "courier")
+          .attr("font-size", 12);
+
+        ready += 1;
       }
 
       function focus(i) {
-        if (i == null) i = width - 1;
-        var value = metric_.valueAt(i);
-        span.datum(value).text(isNaN(value) ? null : format);
+        if (i == null)
+          i = width - 1;
+
+        if (metrics.length == 0)
+          return;
+
+        svg.select(".toolpit-text").selectAll("tspan").remove();
+
+        for (var m in metrics_) {
+          var ppp = width / context.size(); // pixel_per_point
+          if (ppp > 1) {
+            var p0 = Math.floor(i / ppp);
+            var p1 = p0 + 1;
+            var pr = i / ppp - p0;
+            var value = (1 - pr) * metrics_[m].valueAt(p0) + pr * metrics_[m].valueAt(p1);
+          } else {
+            var value = metrics_[m].valueAt(i);
+          }
+
+          svg.select(".toolpit-text").append("tspan")
+            .attr("x", 10).attr("y", 15 + 15 * m)
+            .attr("style", "font-weight:bold")
+            .text(metrics_[m].toString() + ": ");
+
+          svg.select(".toolpit-text").append("tspan")
+            .attr("y", 15 + 15 * m)
+            .attr("style", "stroke:" + colors[m])
+            .text(isNaN(value) ? "n/a" : format(value));
+        }
+
+        var txt_width = 10,
+            txt_height = 10;
+        svg.select(".toolpit-text").each(function() {
+          txt_width = Math.max(txt_width, this.getBBox().width + 10);
+          txt_height = Math.max(txt_height, this.getBBox().height + 10);
+        });
+
+        var dx = (i < width - txt_width - 10) ? i : i - txt_width - 10,
+            dy = 0.9 * height - txt_height;
+        svg.select(".toolpit").attr("transform", "translate(" + dx + ", " + dy + ")");
+        svg.select(".toolpit-rect").attr("width", txt_width);
+        svg.select(".toolpit-rect").attr("height", txt_height);
       }
 
       // Update the chart when the context changes.
       context.on("change.linechart-" + id, change);
       context.on("focus.linechart-" + id, focus);
 
-      // Display the first metric change immediately,
-      // but defer subsequent updates to the canvas change.
-      // Note that someone still needs to listen to the metric,
-      // so that it continues to update automatically.
-      metric_.on("change.linechart-" + id, function(start, stop) {
-        change(start, stop), focus();
-        if (ready) metric_.on("change.linechart-" + id, cubism_identity);
-      });
+      for (var m in metrics_) {
+        metrics_[m].on("change.linechart-" + id, function(start, stop) {
+          change(), focus();
+          if (ready == metrics_.length) metrics_[m].on("change.linechart-" + id, cubism_identity);
+        });
+      }
     });
   }
 
@@ -425,47 +758,47 @@ cubism_contextPrototype.linechart = function() {
         .on("mousemove.linechart", null)
         .on("mouseout.linechart", null);
 
-    selection.selectAll("canvas")
+    selection.selectAll("svg")
         .each(remove)
         .remove();
 
-    selection.selectAll(".title,.value")
+    selection.selectAll(".toolpit")
         .remove();
 
     function remove(d) {
-      d.metric.on("change.linechart-" + d.id, null);
+      d.metrics[0].on("change.linechart-" + d.id, null);
       context.on("change.linechart-" + d.id, null);
       context.on("focus.linechart-" + d.id, null);
     }
   };
 
-  linechart.mode = function(_) {
-    if (!arguments.length) return mode;
-    mode = _ + "";
-    return linechart;
-  };
-
   linechart.height = function(_) {
     if (!arguments.length) return height;
-    buffer.height = height = +_;
+    height = +_;
     return linechart;
   };
 
-  linechart.metric = function(_) {
-    if (!arguments.length) return metric;
-    metric = _;
+  linechart.width = function(_) {
+    if (!arguments.length) return width;
+    width = +_;
+    return linechart;
+  };
+
+  linechart.summarize = function(_) {
+    if (!arguments.length) return summarize;
+    summarize = _;
+    return linechart;
+  };
+
+  linechart.metrics = function(_) {
+    if (!arguments.length) return metrics;
+    metrics = _;
     return linechart;
   };
 
   linechart.scale = function(_) {
     if (!arguments.length) return scale;
     scale = _;
-    return linechart;
-  };
-
-  linechart.extent = function(_) {
-    if (!arguments.length) return extent;
-    extent = _;
     return linechart;
   };
 
@@ -481,14 +814,51 @@ cubism_contextPrototype.linechart = function() {
     return linechart;
   };
 
+  linechart.tickFormat = function(_) {
+    if (!arguments.length) return tickFormat;
+    tickFormat = _;
+    return linechart;
+  };
+
   linechart.colors = function(_) {
     if (!arguments.length) return colors;
     colors = _;
     return linechart;
   };
 
+  linechart.step = function(_) {
+    if (!arguments.length) return step;
+    if (+_ > 0) step = +_;
+    return linechart;
+  };
+
+  linechart.stroke_width = function(_) {
+    if (!arguments.length) return stroke_width;
+    stroke_width = _;
+    return linechart;
+  };
+
+  linechart.axis_width = function(_) {
+    if (!arguments.length) return axis_width;
+    axis_width = +_;
+    return linechart;
+  };
+
+  linechart.tick_position = function(_) {
+    if (!arguments.length) return tick_position;
+    tick_position = _;
+    return linechart;
+  };
+
+  linechart.auto_min = function(_) {
+    if (!arguments.length) return auto_min;
+    auto_min = _;
+    return linechart;
+  };
+
   return linechart;
 };
+
 function cubism_metric(context) {
   if (!(context instanceof cubism_context)) throw new Error("invalid context");
   this.context = context;
@@ -700,8 +1070,7 @@ cubism_contextPrototype.horizon = function() {
       extent = null,
       title = cubism_identity,
       format = d3.format(".2s"),
-      colors = ["#08519c","#3182bd","#6baed6","#bdd7e7","#bae4b3","#74c476","#31a354","#006d2c"],
-      changeFunc = null;
+      colors = ["#08519c","#3182bd","#6baed6","#bdd7e7","#bae4b3","#74c476","#31a354","#006d2c"];
 
   function horizon(selection) {
 
@@ -725,7 +1094,7 @@ cubism_contextPrototype.horizon = function() {
           id = ++cubism_id,
           metric_ = typeof metric === "function" ? metric.call(that, d, i) : metric,
           colors_ = typeof colors === "function" ? colors.call(that, d, i) : colors,
-          extent_ = extent,
+          extent_ = typeof extent === "function" ? extent.call(that, d, i) : extent,
           start = -Infinity,
           step = context.step(),
           canvas = d3.select(that).select("canvas"),
@@ -743,16 +1112,14 @@ cubism_contextPrototype.horizon = function() {
         // compute the new extent and ready flag
         var extent = metric_.extent();
         ready = extent.every(isFinite);
-        var tempExtent = null;
-        if (extent_ != null) tempExtent = typeof extent_ === "function" ? extent_.call(that, d, i) : extent_;
-        if (tempExtent != null) extent = tempExtent;
+        if (extent_ != null) extent = extent_;
 
         // if this is an update (with no extent change), copy old values!
         var i0 = 0, max = Math.max(-extent[0], extent[1]);
         if (this === context) {
           if (max == max_) {
+            i0 = width - cubism_metricOverlap;
             var dx = (start1 - start) / step;
-            i0 = width - Math.max(dx, cubism_metricOverlap);
             if (dx < width) {
               var canvas0 = buffer.getContext("2d");
               canvas0.clearRect(0, 0, width, height);
@@ -782,10 +1149,11 @@ cubism_contextPrototype.horizon = function() {
           scale.range([m * height + y0, y0]);
           y0 = scale(0);
 
-          for (var i = i0, n = width, y1; i < n; ++i) {
+          for (var i = i0, n = width / cubism.pixelWidth | 0, y1; i < n; ++i) {
             y1 = metric_.valueAt(i);
             if (y1 <= 0) { negative = true; continue; }
-            canvas.fillRect(i, y1 = scale(y1), 1, y0 - y1);
+            if (y1 === undefined) continue;
+            canvas.fillRect(i * cubism.pixelWidth, y1 = scale(y1), cubism.pixelWidth, y0 - y1);
           }
         }
 
@@ -805,10 +1173,10 @@ cubism_contextPrototype.horizon = function() {
             scale.range([m * height + y0, y0]);
             y0 = scale(0);
 
-            for (var i = i0, n = width, y1; i < n; ++i) {
+            for (var i = i0, n = width / cubism.pixelWidth | 0, y1; i < n; ++i) {
               y1 = metric_.valueAt(i);
               if (y1 >= 0) continue;
-              canvas.fillRect(i, scale(-y1), 1, y0 - scale(-y1));
+              canvas.fillRect(i * cubism.pixelWidth, scale(-y1), cubism.pixelWidth, y0 - scale(-y1));
             }
           }
         }
@@ -818,7 +1186,7 @@ cubism_contextPrototype.horizon = function() {
 
       function focus(i) {
         if (i == null) i = width - 1;
-        var value = metric_.valueAt(i);
+        var value = metric_.valueAt(i / cubism.pixelWidth | 0);
         span.datum(value).text(isNaN(value) ? null : format);
       }
 
@@ -834,8 +1202,6 @@ cubism_contextPrototype.horizon = function() {
         change(start, stop), focus();
         if (ready) metric_.on("change.horizon-" + id, cubism_identity);
       });
-      
-      changeFunc = change;
     });
   }
 
@@ -857,10 +1223,6 @@ cubism_contextPrototype.horizon = function() {
       context.on("change.horizon-" + d.id, null);
       context.on("focus.horizon-" + d.id, null);
     }
-  };
-  
-  horizon.redraw = function() {
-      changeFunc && changeFunc.call(null);
   };
 
   horizon.mode = function(_) {
@@ -889,7 +1251,7 @@ cubism_contextPrototype.horizon = function() {
 
   horizon.extent = function(_) {
     if (!arguments.length) return extent;
-        extent = _;
+    extent = _;
     return horizon;
   };
 
@@ -1145,12 +1507,14 @@ function cubism_comparisonRoundOdd(i) {
 }
 cubism_contextPrototype.axis = function() {
   var context = this,
+      width = context.size(),
       scale = context.scale,
       axis_ = d3.svg.axis().scale(scale);
 
-  var format = context.step() < 6e4 ? cubism_axisFormatSeconds
+  var formatDefault = context.step() < 6e4 ? cubism_axisFormatSeconds
       : context.step() < 864e5 ? cubism_axisFormatMinutes
       : cubism_axisFormatDays;
+  var format = formatDefault;
 
   function axis(selection) {
     var id = ++cubism_id,
@@ -1158,7 +1522,7 @@ cubism_contextPrototype.axis = function() {
 
     var g = selection.append("svg")
         .datum({id: id})
-        .attr("width", context.size())
+        .attr("width", width)
         .attr("height", Math.max(28, -axis.tickSize()))
       .append("g")
         .attr("transform", "translate(0," + (axis_.orient() === "top" ? 27 : 4) + ")")
@@ -1170,16 +1534,25 @@ cubism_contextPrototype.axis = function() {
           .style("display", "none")
           .text(null);
     });
-    
+
     context.on("focus.axis-" + id, function(i) {
       if (tick) {
         if (i == null) {
-          tick.style("display", "none");
-          g.selectAll("text").style("fill-opacity", null);
+            tick.style("display", "none");
+            g.selectAll("text").style("fill-opacity", null);
         } else {
-          tick.style("display", null).attr("x", i).text(format(scale.invert(i)));
-          var dx = tick.node().getComputedTextLength() + 6;
-          g.selectAll("text").style("fill-opacity", function(d) { return Math.abs(scale(d) - i) < dx ? 0 : 1; });
+            i = (i / cubism.pixelWidth | 0) * cubism.pixelWidth;
+            tick.style("display", null).text(format(scale.invert(i)));
+            var dx = tick.node().getComputedTextLength() + 6;
+            var dxt = (dx - 6) / 2;
+
+            if (i + dxt > width) 
+                i = width - dxt;
+            else if (i - dxt < 0)
+                i = dxt;
+
+            tick.attr('x', i);
+            g.selectAll("text").style("opacity", function(d) { return Math.abs(scale(d) - i) < dx ? 0 : 1; });
         }
       }
     });
@@ -1195,6 +1568,19 @@ cubism_contextPrototype.axis = function() {
       context.on("change.axis-" + d.id, null);
       context.on("focus.axis-" + d.id, null);
     }
+  };
+
+  axis.width = function(_) {
+    if (!arguments.length) return width;
+    width = +_;
+    scale = context.scale.range([0, width]);
+    axis_ = axis_.scale(scale);
+  };
+  
+  axis.focusFormat = function(_) {
+    if (!arguments.length) return format == formatDefault ? null : _;
+    format = _ == null ? formatDefault : _;
+    return axis;
   };
 
   return d3.rebind(axis, axis_,
@@ -1248,9 +1634,9 @@ cubism_contextPrototype.rule = function() {
     });
 
     context.on("focus.rule-" + id, function(i) {
-      line
+      line.datum(i)
           .style("display", i == null ? "none" : null)
-          .style("left", i == null ? null : i + 'px');
+          .style("left", i == null ? null : cubism_ruleLeft);
     });
   }
 
@@ -1279,11 +1665,11 @@ function cubism_ruleStyle(line) {
       .style("position", "absolute")
       .style("top", 0)
       .style("bottom", 0)
-      .style("width", "1px")
+      .style("width", cubism.pixelWidth + "px")
       .style("pointer-events", "none");
 }
 
 function cubism_ruleLeft(i) {
-  return i + "px";
+  return (i / cubism.pixelWidth | 0) * cubism.pixelWidth + "px";
 }
 })(this);
